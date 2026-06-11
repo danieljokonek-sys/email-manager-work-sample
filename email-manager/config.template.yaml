@@ -1,0 +1,86 @@
+# Email Cleanup & Brief Manager — Configuration Template
+# This file is overwritten by the setup wizard on first run.
+# You can also edit it manually after setup.
+
+owner:
+  name: ""
+  phone: ""
+  # Free-text description of who you are — used by the AI to personalize your briefing.
+  # Example: "I'm a freelance designer running two client businesses and managing a rental property."
+  profile: ""
+  # What types of information matter most in your daily briefing.
+  # Example: "Financial obligations and deadlines are top priority. Surface anything about client invoices or upcoming events."
+  briefing_priorities: ""
+
+# Email accounts to monitor
+# Supported providers: gmail, outlook, yahoo, imap
+# Example account entry:
+# accounts:
+#   - name: "Personal"
+#     provider: "gmail"
+#     email: "you@gmail.com"
+#     token_file: "credentials/token_personal.json"
+#     primary_entities: ["personal"]
+accounts: []
+
+# Digest settings
+digest:
+  send_to: ""
+  send_from_account: ""
+  schedule:
+    daily_summary: "08:00"
+    weekly_deep_dive: "monday 09:00"
+
+# Business entities (define your own or leave empty)
+entities: {}
+
+# Label categories for inbox cleanup.
+# Each entry defines a category the AI can assign to emails.
+# Entity-based categories are auto-generated from your entities above.
+# protection: "vital" (never auto-deleted), "standard" (kept but can be aged out), "none" (no protection)
+# auto_delete: true means emails in this category are trashed automatically (e.g. Junk)
+#
+# Example:
+# labels:
+#   - name: "Tax"
+#     group: "Finance"
+#     description: "Tax documents, W-2s, 1099s, CPA correspondence"
+#     protection: "vital"
+#   - name: "Junk"
+#     group: ""
+#     description: "Marketing, spam, newsletters"
+#     protection: "none"
+#     auto_delete: true
+labels: []
+
+# Google API settings (only needed if you have Gmail accounts)
+google:
+  credentials_file: "credentials/credentials.json"
+  max_emails_per_fetch: 100
+  lookback_days: 90
+  calendar_days_ahead: 14
+
+# Microsoft settings (only needed if you have Outlook accounts)
+# microsoft:
+#   client_id: ""
+#   tenant_id: "common"
+
+sms:
+  forwarding_email_subject_prefix: "Fwd: Text from"
+  enabled: false
+
+analysis:
+  model: "claude-opus-4-6"
+  batch_size: 20
+
+cleanup:
+  model: "claude-sonnet-4-6"
+  batch_size: 25
+  delay_after_digest_minutes: 20
+  accounts: []
+
+features:
+  auto_label_emails: true
+  follow_up_detection: true
+  follow_up_days: 3
+  nag_after_days: 3

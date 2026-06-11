@@ -1,0 +1,36 @@
+# Secrets and user-specific config
+.env
+**/credentials/token*.json
+**/credentials/credentials.json
+**/credentials/_expired_backup_*/
+**/config.yaml
+
+# Data
+**/data/
+
+# Logs
+**/logs/*.log
+
+# Local task scheduler artifacts
+**/_task_definition.xml
+**/_create_task.ps1
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
