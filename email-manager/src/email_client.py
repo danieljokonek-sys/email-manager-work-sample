@@ -15,8 +15,14 @@ class EmailClient(ABC):
     provider: str  # "gmail", "outlook", "yahoo", "imap"
 
     @abstractmethod
-    def authenticate(self):
-        """Authenticate with the provider. May open browser for OAuth."""
+    def authenticate(self, interactive: bool = False):
+        """Authenticate with the provider.
+
+        interactive=True permits opening a browser to (re-)mint credentials —
+        use only from interactive commands like setup-accounts. The scheduled
+        pipeline calls with interactive=False so a dead token raises instead of
+        hanging on a browser prompt that no one is there to complete.
+        """
         ...
 
     @abstractmethod

@@ -95,10 +95,20 @@ def build_calendar_clients(config: dict, email_clients: list[EmailClient]) -> li
 
 
 def get_send_client(config: dict, clients: list[EmailClient]) -> EmailClient:
-    """Return the EmailClient that should send digest emails."""
+    """Return the EmailClient that should send digest emails.
+
+    Matches by account email rather than list index, so it stays correct even
+    when `clients` has been filtered to only the accounts that authenticated.
+    """
     send_from = config.get("digest", {}).get("send_from_account", "Personal")
     accounts = config.get("accounts", [])
-    for i, acct in enumerate(accounts):
-        if acct["name"] == send_from and i < len(clients):
-            return clients[i]
+    send_from_email = next(
+        (a["email"] for a in accounts if a.get("name") == send_from), None
+    )
+    if send_from_email:
+        for client in clients:
+            if client.account_email == send_from_email:
+                return client
+    if not clients:
+        raise RuntimeError("No authenticated accounts available to send the digest.")
     return clients[0]

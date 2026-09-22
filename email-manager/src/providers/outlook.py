@@ -38,7 +38,7 @@ class OutlookClient(EmailClient):
     def supports_calendar(self) -> bool:
         return True
 
-    def authenticate(self):
+    def authenticate(self, interactive: bool = False):
         token_path = Path(self.token_file)
         cache = msal.SerializableTokenCache()
         if token_path.exists():

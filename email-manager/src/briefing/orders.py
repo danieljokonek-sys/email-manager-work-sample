@@ -11,6 +11,7 @@ import anthropic
 from datetime import date
 
 from src.entities import Entity
+from src.llm_usage import log_usage
 
 
 # Status labels for display
@@ -89,9 +90,10 @@ Respond with JSON only. Return null if this email is not order-related."""
 
 
 class OrderExtractor:
-    def __init__(self, model: str = "claude-opus-4-6"):
+    def __init__(self, model: str = "claude-sonnet-5", effort: str = "low"):
         self.client = anthropic.Anthropic()
         self.model = model
+        self.effort = effort
 
     def extract_from_email(self, email: dict) -> dict | None:
         """Extract song order fields from a single email. Returns dict or None."""
@@ -103,9 +105,11 @@ class OrderExtractor:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=2000,
+            output_config={"effort": self.effort},
             system=ORDER_EXTRACTION_SYSTEM.format(today=date.today().isoformat()),
             messages=[{"role": "user", "content": f"Extract order info from this email:\n\n{text}"}],
         )
+        log_usage("order-extract", response)
 
         for block in response.content:
             if block.type == "text":

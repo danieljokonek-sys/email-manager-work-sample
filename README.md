@@ -1,27 +1,31 @@
-# Email Manager — AI Briefing + Inbox Cleanup
+# Email Manager: AI Briefing + Inbox Cleanup
 
-> **📌 Work sample.** This is a real, working personal project, shared publicly as a code/work sample for recruiters and hiring managers. It is a sanitized copy of a tool the author uses daily to run several small businesses out of five inboxes — all secrets, credentials, and personal data have been removed (see `config.template.yaml` for the configurable surface). Built solo with Claude Code.
+> **📌 Work sample.** This is a real, working personal project, shared publicly as a code sample for recruiters and hiring managers. It is a sanitized copy of a tool the author runs every morning across five inboxes for several small businesses. Secrets, credentials, and personal data have been removed; `config.template.yaml` shows the configurable surface. Built solo with Claude Code.
 
-A self-hosted, AI-powered email tool that does two jobs across all of your inboxes:
+A self-hosted email tool that does two jobs across all of your inboxes:
 
-1. **Daily briefing** — reads every account, extracts what actually matters (deadlines, money owed, action items, calendar-linked commitments), and emails you one clean digest each morning.
-2. **Inbox cleanup** — classifies, labels, archives, and safely deletes mail against categories you define, with guardrails so nothing important is ever lost.
+1. **Daily briefing.** Reads every account, extracts what matters (deadlines, money owed, action items, calendar commitments), and emails one read-only bulletin board each morning.
+2. **Inbox cleanup.** Classifies, labels, archives, and deletes mail against categories you define, with guards so nothing important is lost.
 
-Built to run a portfolio of small businesses and personal accounts out of five inboxes without drowning in email. Works with **Gmail, Outlook/Hotmail, Yahoo, and any IMAP provider** — you configure only the ones you use.
+Works with **Gmail, Outlook/Hotmail, Yahoo, and any IMAP provider**. You configure only the accounts you use.
 
-> Built solo with **Claude Code**. Two Claude models do the reasoning: **Opus** for the deeper briefing analysis, **Sonnet** for fast, high-volume inbox classification.
+Every Claude call runs on one model, `claude-sonnet-5`, with the effort level set per job.
 
 ---
 
 ## Highlights
 
-- **Two AI pipelines, two model tiers.** Opus extracts structured items (agreements, deadlines, receivables/payables, action items) from email batches; Sonnet handles fast inbox classification. Model choice is matched to the cost/latency profile of each job.
-- **Provider-agnostic architecture.** A single `EmailClient` abstract base; Gmail (Google API + OAuth), Outlook (Microsoft Graph + MSAL), and Yahoo/IMAP each implement it. A factory builds the right client per account at runtime. Add a provider by implementing one interface.
-- **Config-driven, nothing hardcoded.** Business entities, label taxonomy, owner profile, briefing priorities, and schedules all live in `config.yaml` and are injected into the prompts at runtime. The same codebase personalizes to any user via the setup wizard.
-- **Safety guards on destructive actions.** "Vital" categories are never auto-deleted, low-confidence classifications are archived rather than trashed, and emails with attachments are never auto-deleted.
-- **Cross-platform scheduling.** Unattended daily runs via Windows Task Scheduler or macOS launchd, with logging and idempotent processing (a SQLite ledger prevents re-processing the same mail).
-- **One-command setup.** An interactive wizard handles profile, accounts, OAuth, labels, scheduling, and provider credentials; `run.bat` / `install.sh` bootstrap the environment on first launch.
-- **Local web dashboard.** A small Flask app (`localhost:5050`) to check off tracked items, linked from the top of every briefing.
+- **The briefing is a read-only bulletin board.** Two sections: "Today" (at most seven items) and "Next Two Weeks" (day by day). There is nothing to check off. Dated items age off once their date passes, and undated items drop about a week after they were first seen. The window rules live in one place in `src/briefing/database.py`.
+- **One model, effort dialed per call.** Extraction, duplicate reconciliation, and inbox classification run at low effort. Writing the board runs at medium. Model and effort for each job are set in `config.yaml`.
+- **Token cost engineered down.** The board writer receives only the items that will appear on today's board, with trimmed fields and compact JSON. A digest costs roughly 4 to 8K input tokens. The previous version sent every pending row, twice.
+- **Every Claude call logs its usage.** A one-line `claude-usage` logger records the tag, model, input tokens, output tokens, and stop reason for each call, so `logs/daily_run.log` shows where the spend went.
+- **Dry run.** `python main.py digest --dry-run` writes the board to `logs/last_digest.html` and sends nothing.
+- **Provider-agnostic architecture.** A single `EmailClient` abstract base. Gmail (Google API + OAuth), Outlook (Microsoft Graph + MSAL), and Yahoo/IMAP each implement it, and a factory builds the right client per account at runtime. Add a provider by implementing one interface.
+- **Config-driven, nothing hardcoded.** Business entities, label taxonomy, owner profile, briefing priorities, and schedules live in `config.yaml` and are injected into the prompts at runtime. The same codebase personalizes to any user through the setup wizard.
+- **Safety guards on destructive actions.** "Vital" categories are never auto-deleted, low-confidence classifications are archived instead of trashed, emails with attachments are never auto-deleted, and cleanup skips the tool's own briefing.
+- **Resilient unattended runs.** Each account authenticates in isolation, so one dead OAuth token does not stop the others. A failure is emailed to the owner, written to a marker file, and shown as a desktop toast. Scheduled runs fail fast on a missing token instead of waiting on a browser prompt nobody will answer.
+- **Once-per-day guard.** `daily_run.bat` records the date of the last successful run and exits if it already ran today, so duplicate scheduler triggers cannot send duplicate briefings. `--force` overrides it.
+- **Cross-platform scheduling and one-command setup.** Windows Task Scheduler or macOS launchd. An interactive wizard handles profile, accounts, OAuth, labels, and scheduling; `run.bat` and `install.sh` bootstrap the environment on first launch.
 
 ---
 
@@ -29,46 +33,49 @@ Built to run a portfolio of small businesses and personal accounts out of five i
 
 For reviewers, this project is here to show:
 
-- **Practical AI integration** — designing structured-extraction and classification prompts, choosing the right model tier per task (Opus vs. Sonnet), and turning model output into reliable, acted-upon data.
-- **System design** — a clean provider abstraction, config-driven behavior, idempotent processing, and safety guards around destructive actions.
-- **Shipping end to end, solo** — from architecture (`CLAUDE.md`) through a working CLI, OAuth flows for three email platforms, a local dashboard, cross-platform scheduling, setup tooling, and user documentation.
-- **AI-native development** — the whole thing was built with Claude Code against a written spec, the same way the author runs day-to-day operations.
+- **Practical AI integration.** Structured-extraction and classification prompts, effort set per call on a single model, and model output turned into ledger rows that the rest of the tool acts on.
+- **Cost engineering.** The digest's input shrank from every pending row to only the rows on today's board, and every call logs its token usage so the cost of each stage is visible in the daily log.
+- **Taking a feature out on purpose.** The first version had a local Flask dashboard for checking items off. Keeping it running cost more than the check-off saved, so it was retired and the digest was redesigned so items expire by rule instead of by hand.
+- **System design.** One provider interface, config-driven behavior, idempotent processing, and guards around destructive actions.
+- **Shipping end to end, solo.** Architecture notes in `CLAUDE.md`, a working CLI, OAuth flows for three email platforms, cross-platform scheduling, setup tooling, and user documentation.
+- **AI-native development.** The whole thing was built with Claude Code against a written spec, the same way the author runs day-to-day operations.
 
-It is not a library to adopt or a product to install — it is a finished, real-world tool shared as evidence of how the author thinks and builds.
+It is a finished tool in daily use, shared as evidence of how the author thinks and builds.
 
 ---
 
 ## How it works
 
 ```
-                ┌─────────────────────────── run ───────────────────────────┐
-  Accounts ──▶ Fetch ──▶ Analyze (Opus) ──▶ Label ──▶ Digest email ──▶ (20m) ──▶ Cleanup (Sonnet)
- (Gmail/        +cal      structured        Gmail      HTML brief +              classify → label /
-  Outlook/      events    extraction        labels     dashboard link            archive / trash
-  Yahoo/IMAP)                                                                    (guarded)
+                 ┌──────────────────────────────── run ────────────────────────────────┐
+  Accounts ──▶ Fetch ──▶ Analyze ──▶ Label ──▶ Follow-ups ──▶ Digest ──▶ (20 min) ──▶ Cleanup
+ (Gmail/        +cal      extract     Gmail     sent-folder    2-section   wait          classify →
+  Outlook/      events    items to    labels    scan           board                     label / archive /
+  Yahoo/IMAP)             SQLite                               emailed                   trash (guarded)
 ```
 
-- **Briefing pipeline:** fetch new mail + calendar → Opus extracts structured items → apply entity labels → generate and send an HTML digest (Headlines, Urgent, a 14-day horizon that ties pending items to upcoming calendar events, financial status, tasks).
-- **Cleanup pipeline:** fetch inbox → skip already-processed (SQLite ledger) → Sonnet classifies into your categories with an action + confidence → label / archive / trash under the safety guards → record the result.
+**Briefing pipeline.** Fetch new mail plus calendar events. Claude extracts agreements, deadlines, financial items, and action items from each batch into a SQLite ledger. Entity labels are applied in Gmail. A sent-folder scan finds threads still waiting on a reply. Then the board is built: window rules pick what belongs on today's board, one Claude call merges duplicates (an invoice, its reminder, and its past-due notice become one line), and one Claude call writes the two-section HTML, which is emailed.
+
+**Cleanup pipeline.** Fetch the inbox, skip anything already processed (SQLite ledger), have Claude classify each message into your categories with an action and a confidence, then label, archive, or trash under the safety guards and record the result.
 
 ### Tech
 
-Python 3.11 · Anthropic SDK (Opus + Sonnet) · Google API & Microsoft Graph (MSAL) & IMAP · Click CLI + Rich · SQLite (two stores: briefing + cleanup) · Flask (local dashboard) · Windows Task Scheduler / macOS launchd.
+Python 3.11 · Anthropic SDK (Claude Sonnet 5, effort per call) · Google API, Microsoft Graph (MSAL), IMAP · Click CLI + Rich · SQLite (two stores: briefing + cleanup) · Windows Task Scheduler / macOS launchd.
 
-See [`CLAUDE.md`](CLAUDE.md) for the full architecture and design notes (this is the spec the project was built against with Claude Code).
+See [`CLAUDE.md`](CLAUDE.md) for the architecture and design notes. That file is the spec the project was built against with Claude Code.
 
 ---
 
 ## Setup & Usage
 
-*The setup, commands, and troubleshooting below are included to show the project is complete, documented, and genuinely runnable — not as a request for reviewers to install anything.*
+*The setup, commands, and troubleshooting below are included to show the project is complete, documented, and runnable. Reviewers are not expected to install anything.*
 
 ### What You Need Before Starting
 
 1. **Python 3.11 or newer**
-   - **Windows:** [python.org/downloads](https://www.python.org/downloads/) — check "Add Python to PATH" during install
+   - **Windows:** [python.org/downloads](https://www.python.org/downloads/), and check "Add Python to PATH" during install
    - **Mac:** the installer handles it
-2. **An Anthropic API key** — sign up at [console.anthropic.com](https://console.anthropic.com), create a key (starts with `sk-ant-`). Roughly $5–10/month depending on email volume.
+2. **An Anthropic API key.** Sign up at [console.anthropic.com](https://console.anthropic.com) and create a key (starts with `sk-ant-`). On Sonnet 5 at low effort this typically costs a few dollars a month, depending on email volume.
 
 ## Setup (5 minutes)
 
@@ -87,11 +94,12 @@ Run from the `email-manager` folder:
 | Command | What it does |
 |---------|-------------|
 | `python main.py run` | Full pipeline now (fetch + analyze + briefing + cleanup) |
-| `python main.py dashboard` | Open the web dashboard to mark items done |
+| `python main.py digest --dry-run` | Build today's board into `logs/last_digest.html` without emailing it |
 | `python main.py status` | See everything currently tracked |
 | `python main.py cleanup inbox` | Organize the inbox without the full pipeline |
+| `python main.py cleanup stats` | How many emails have been organized, by category |
 | `python main.py horizon` | Next 14 days: calendar + pending items together |
-| `python main.py tasks add "Do the thing"` | Add a floating task |
+| `python main.py tasks add "Do the thing"` | Add a task; it shows on the board until its date passes |
 
 ## Supported Email Providers
 
@@ -107,14 +115,15 @@ Connect as many accounts as you want, in any combination.
 ## Troubleshooting (highlights)
 
 - **"Python is not recognized" (Windows):** reinstall from python.org with "Add Python to PATH" checked.
-- **Gmail stops working after ~a week:** the Google OAuth app is still in "Testing" mode (refresh tokens expire after 7 days). Publish the app at [console.cloud.google.com](https://console.cloud.google.com/apis/credentials/consent) → **PUBLISH APP**, then re-authorize. No Google review is needed for personal use.
-- **Scheduled run didn't fire:** check `email-manager/logs/daily_run.log` (Windows) or `launchctl list | grep emailmanager` (Mac).
-- **Stuck?** Run `get-help.bat` / `bash get-help.sh` — it runs diagnostics, copies them to your clipboard, and opens Claude to help debug.
+- **Gmail stops working after about a week:** the Google OAuth app is still in "Testing" mode, so refresh tokens expire after 7 days. Publish the app at [console.cloud.google.com](https://console.cloud.google.com/apis/credentials/consent) (**PUBLISH APP**), then run `python main.py setup-accounts` to re-authorize. No Google review is needed for personal use.
+- **An account needs re-authorization:** the daily run emails you, writes `logs/AUTH_FAILURE.txt`, and keeps going for the accounts that still work. Run `python main.py setup-accounts`.
+- **Scheduled run didn't fire:** check `email-manager/logs/daily_run.log` (Windows) or `launchctl list | grep emailmanager` (Mac). If the log says "Skipped: already ran successfully today", the once-per-day guard did its job; use `daily_run.bat --force` to run again.
+- **Stuck?** Run `get-help.bat` / `bash get-help.sh`. It runs diagnostics, copies them to your clipboard, and opens Claude to help debug.
 
 ## Project Layout
 
-`email-manager/` holds the app: `main.py` (CLI), `setup_wizard.py`, `src/` (providers, briefing, cleanup), `docs/`. User-specific files (`config.yaml`, `.env`, `credentials/`, `data/`) are created locally and are git-ignored — they are never committed.
+`email-manager/` holds the app: `main.py` (CLI), `setup_wizard.py`, `src/` (providers, briefing, cleanup, `llm_usage.py`), `docs/`. User-specific files (`config.yaml`, `.env`, `credentials/`, `data/`, `logs/`) are created locally and git-ignored. They are never committed.
 
 ---
 
-*Shared as a work sample — a real project, sanitized for public release. Built with Claude Code. MIT licensed — see [LICENSE](LICENSE).*
+*Shared as a work sample: a real project, sanitized for public release. Built with Claude Code. MIT licensed, see [LICENSE](LICENSE).*

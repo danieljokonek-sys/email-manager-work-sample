@@ -141,6 +141,18 @@ def _migrate(conn: sqlite3.Connection):
         except Exception:
             pass
 
+    # Add merged_into to item tables (duplicate reconciliation). A row whose
+    # status is 'merged' was folded into the canonical item pointed to here; it
+    # is kept (never deleted) so the merge is reversible and history survives.
+    merge_tables = ["action_items", "deadlines", "financial_items"]
+    for table in merge_tables:
+        try:
+            cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "merged_into" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN merged_into INTEGER")
+        except Exception:
+            pass
+
     # Clear calendar events stored with old timezone-offset format (e.g. +00:00 or -07:00).
     # UTC-naive ISO datetimes are exactly 19 chars: '2026-04-08T17:00:00'
     # Anything longer has a timezone suffix and must be re-fetched.
@@ -458,9 +470,26 @@ def get_pending_deadlines(days_ahead: int = 14) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_pending_financial(direction: Optional[str] = None) -> list[dict]:
+def get_pending_financial(
+    direction: Optional[str] = None, max_age_days: int = 7
+) -> list[dict]:
+    """Return pending financial items for the brief.
+
+    Fall-off rule: an item first seen more than ``max_age_days`` ago drops off
+    the brief so stale balances don't pile up. Exception — if it carries a due
+    date that is still in the future, it stays on until that due date passes.
+    Age is measured from ``source_date`` (falling back to ``created_at``), i.e.
+    when the item was first picked up from email. Used by the CLI ``status``
+    view; the emailed board uses get_bulletin_items() instead.
+    """
     conn = get_connection()
     snooze_filter = "AND (f.snoozed_until IS NULL OR f.snoozed_until <= date('now'))"
+    # Keep if first seen within the window, OR still due at a future date.
+    age_filter = (
+        "AND (date(COALESCE(f.source_date, f.created_at)) >= date('now', ?) "
+        "OR (f.due_date IS NOT NULL AND date(f.due_date) >= date('now')))"
+    )
+    age_param = f"-{int(max_age_days)} days"
     if direction:
         rows = conn.execute(
             f"""SELECT f.*, e.subject as email_subject, e.sender as email_sender
@@ -468,8 +497,9 @@ def get_pending_financial(direction: Optional[str] = None) -> list[dict]:
                LEFT JOIN emails e ON f.email_id = e.id
                WHERE f.status = 'pending' AND f.direction = ?
                {snooze_filter}
+               {age_filter}
                ORDER BY f.due_date ASC NULLS LAST""",
-            (direction,),
+            (direction, age_param),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -478,7 +508,9 @@ def get_pending_financial(direction: Optional[str] = None) -> list[dict]:
                LEFT JOIN emails e ON f.email_id = e.id
                WHERE f.status = 'pending'
                {snooze_filter}
-               ORDER BY f.direction, f.due_date ASC NULLS LAST"""
+               {age_filter}
+               ORDER BY f.direction, f.due_date ASC NULLS LAST""",
+            (age_param,),
         ).fetchall()
     # Connection is reused (singleton) — do not close
     return [dict(r) for r in rows]
@@ -516,6 +548,212 @@ def get_pending_actions(owner_name: str = "Daniel") -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── Bulletin board ───────────────────────────────────────────────────────────
+#
+# The emailed brief is a read-only bulletin board. Nothing is ever checked
+# off, so every item has to age off on its own. The rules, in days:
+#   - dated items (deadlines, action items, money, tasks) show from
+#     ``overdue_grace_days`` after their date passes (so a miss is still
+#     visible for a few mornings) through ``days_ahead`` into the future;
+#   - undated action/money items show for ``undated_ttl_days`` after they were
+#     first seen (source_date, falling back to created_at), then drop;
+#   - undated manual tasks show for 14 days after they were added;
+#   - waiting-for-reply threads show only while the sent-folder scan keeps
+#     re-detecting them (updated within the last 2 days) and they have been
+#     waiting at least ``follow_up_min_days``.
+# Only what is on the board is sent to Claude, which is also what keeps the
+# digest call small.
+
+BULLETIN_DAYS_AHEAD = 14
+BULLETIN_OVERDUE_GRACE_DAYS = 3
+BULLETIN_UNDATED_TTL_DAYS = 7
+
+_EVENT_FIELDS = ("title", "start_date", "start_datetime", "end_datetime",
+                 "all_day", "location", "calendar_name", "entity_key")
+_DEADLINE_FIELDS = ("id", "entity_key", "description", "due_date", "priority")
+_ACTION_FIELDS = ("id", "entity_key", "description", "due_date", "priority", "source_date")
+_FINANCIAL_FIELDS = ("id", "entity_key", "direction", "counterparty", "amount",
+                     "currency", "description", "due_date", "source_date")
+_TASK_FIELDS = ("id", "entity_key", "title", "notes", "due_date", "priority")
+_FOLLOW_UP_FIELDS = ("id", "entity_key", "subject", "recipient", "days_waiting", "last_sent_date")
+
+
+def _pick(row: dict, keys: tuple) -> dict:
+    """Keep only the listed keys, dropping empty values, to shrink the prompt."""
+    return {k: row[k] for k in keys if row.get(k) not in (None, "", "[]", 0)}
+
+
+def get_bulletin_items(
+    days_ahead: int = BULLETIN_DAYS_AHEAD,
+    overdue_grace_days: int = BULLETIN_OVERDUE_GRACE_DAYS,
+    undated_ttl_days: int = BULLETIN_UNDATED_TTL_DAYS,
+    follow_up_min_days: int = 3,
+    owner_name: str = "Daniel",
+    exclude_recipients: tuple[str, ...] = (),
+) -> dict:
+    """Return everything that belongs on today's board, trimmed for the prompt.
+
+    ``exclude_recipients`` is the owner's own addresses: a sent thread whose
+    recipient is one of them is a note-to-self, not a reply being waited on.
+    """
+    conn = get_connection()
+    ahead = f"+{int(days_ahead)} days"
+    grace = f"-{int(overdue_grace_days)} days"
+    ttl = f"-{int(undated_ttl_days)} days"
+
+    events = [_pick(e, _EVENT_FIELDS) for e in get_upcoming_events(days_ahead=days_ahead)]
+
+    deadlines = [_pick(dict(r), _DEADLINE_FIELDS) for r in conn.execute(
+        """SELECT id, entity_key, description, due_date, priority
+           FROM deadlines
+           WHERE status = 'pending' AND due_date IS NOT NULL
+             AND date(due_date) BETWEEN date('now', ?) AND date('now', ?)
+           ORDER BY due_date ASC""",
+        (grace, ahead),
+    ).fetchall()]
+
+    action_items = [_pick(dict(r), _ACTION_FIELDS) for r in conn.execute(
+        """SELECT id, entity_key, description, due_date, priority, source_date
+           FROM action_items a
+           WHERE status = 'pending'
+             AND (assigned_to IS NULL
+                  OR lower(assigned_to) = 'owner'
+                  OR lower(assigned_to) LIKE '%' || lower(?) || '%')
+             AND ((due_date IS NOT NULL
+                   AND date(due_date) BETWEEN date('now', ?) AND date('now', ?))
+                  OR (due_date IS NULL
+                      AND date(COALESCE(source_date, created_at)) >= date('now', ?)))
+           ORDER BY due_date IS NULL, due_date ASC,
+                    CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END""",
+        (owner_name, grace, ahead, ttl),
+    ).fetchall()]
+
+    financial_items = [_pick(dict(r), _FINANCIAL_FIELDS) for r in conn.execute(
+        """SELECT id, entity_key, direction, counterparty, amount, currency,
+                  description, due_date, source_date
+           FROM financial_items
+           WHERE status = 'pending'
+             AND ((due_date IS NOT NULL
+                   AND date(due_date) BETWEEN date('now', ?) AND date('now', ?))
+                  OR (due_date IS NULL
+                      AND date(COALESCE(source_date, created_at)) >= date('now', ?)))
+           ORDER BY due_date IS NULL, due_date ASC, direction""",
+        (grace, ahead, ttl),
+    ).fetchall()]
+
+    tasks = [_pick(dict(r), _TASK_FIELDS) for r in conn.execute(
+        """SELECT id, entity_key, title, notes, due_date, priority
+           FROM tasks
+           WHERE status = 'pending'
+             AND ((due_date IS NOT NULL
+                   AND date(due_date) BETWEEN date('now', ?) AND date('now', ?))
+                  OR (due_date IS NULL AND date(created_at) >= date('now', '-14 days')))
+           ORDER BY due_date IS NULL, due_date ASC,
+                    CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END""",
+        (grace, ahead),
+    ).fetchall()]
+
+    follow_ups = [_pick(dict(r), _FOLLOW_UP_FIELDS) for r in conn.execute(
+        """SELECT id, entity_key, subject, recipient, days_waiting, last_sent_date
+           FROM follow_ups
+           WHERE status = 'pending'
+             AND days_waiting BETWEEN ? AND 21
+             AND datetime(substr(updated_at, 1, 19)) >= datetime('now', '-2 days')
+           ORDER BY days_waiting DESC""",
+        (follow_up_min_days,),
+    ).fetchall()]
+    if exclude_recipients:
+        own = tuple(a.lower() for a in exclude_recipients if a)
+        follow_ups = [
+            fu for fu in follow_ups
+            if not any(addr in (fu.get("recipient") or "").lower() for addr in own)
+        ]
+
+    # Connection is reused (singleton) — do not close
+    return {
+        "events": events,
+        "deadlines": deadlines,
+        "action_items": action_items,
+        "financial_items": financial_items,
+        "tasks": tasks,
+        "follow_ups": follow_ups,
+    }
+
+
+# ── Duplicate reconciliation ────────────────────────────────────────────────
+
+# Fields the reconciler is allowed to overwrite on a canonical row, per type.
+_MERGEABLE_FIELDS = {
+    "financial_items": {"counterparty", "amount", "currency", "description",
+                        "due_date", "source_date", "entity_key", "direction"},
+    "action_items": {"description", "assigned_to", "due_date", "priority",
+                     "source_date", "entity_key"},
+    "deadlines": {"description", "due_date", "priority", "source_date",
+                  "entity_key"},
+}
+
+_RECONCILE_COLUMNS = {
+    "financial_items": ("id, entity_key, direction, counterparty, amount, currency, "
+                        "description, due_date, source_date, created_at"),
+    "action_items": ("id, entity_key, description, assigned_to, due_date, priority, "
+                     "source_date, created_at"),
+    "deadlines": "id, entity_key, description, due_date, priority, source_date, created_at",
+}
+
+
+def get_reconcilable_items(board: dict | None = None) -> dict:
+    """Return the items on today's board, with the columns the reconciler needs.
+
+    Only items that will actually be displayed are candidates for dedup: that
+    is where duplicates are visible, and it keeps the reconcile prompt small.
+    Grouped by type so the reconciler can only ever merge like-with-like.
+    """
+    board = board if board is not None else get_bulletin_items()
+    conn = get_connection()
+    out = {}
+    for table, cols in _RECONCILE_COLUMNS.items():
+        ids = [int(i["id"]) for i in board.get(table, []) if i.get("id") is not None]
+        if not ids:
+            out[table] = []
+            continue
+        placeholders = ",".join("?" * len(ids))
+        out[table] = [dict(r) for r in conn.execute(
+            f"SELECT {cols} FROM {table} WHERE id IN ({placeholders})", ids
+        ).fetchall()]
+    # Connection is reused (singleton) — do not close
+    return out
+
+
+def apply_item_merge(item_type: str, canonical_id: int,
+                     duplicate_ids: list[int], canonical_fields: dict) -> None:
+    """Fold ``duplicate_ids`` into ``canonical_id`` for one item type.
+
+    The canonical row is updated with the synthesized fields (only known,
+    allowed columns are touched); each duplicate is marked status='merged'
+    with merged_into pointing at the survivor. Nothing is deleted.
+    """
+    allowed = _MERGEABLE_FIELDS.get(item_type)
+    dupes = [d for d in duplicate_ids if d != canonical_id]
+    if not allowed or not dupes:
+        return
+    conn = get_connection()
+    sets = {k: v for k, v in (canonical_fields or {}).items() if k in allowed}
+    if sets:
+        cols = ", ".join(f"{k} = ?" for k in sets)
+        conn.execute(
+            f"UPDATE {item_type} SET {cols} WHERE id = ?",
+            (*sets.values(), canonical_id),
+        )
+    placeholders = ",".join("?" * len(dupes))
+    conn.execute(
+        f"UPDATE {item_type} SET status = 'merged', merged_into = ? "
+        f"WHERE id IN ({placeholders}) AND status = 'pending'",
+        (canonical_id, *dupes),
+    )
+    conn.commit()
+    # Connection is reused (singleton) — do not close
+
+
 def get_sync_state(key: str) -> Optional[str]:
     conn = get_connection()
     row = conn.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
@@ -529,16 +767,6 @@ def set_sync_state(key: str, value: str):
         "INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)",
         (key, value, datetime.utcnow().isoformat()),
     )
-    conn.commit()
-    # Connection is reused (singleton) — do not close
-
-
-def update_item_status(table: str, item_id: int, status: str):
-    allowed_tables = {"agreements", "deadlines", "financial_items", "action_items", "tasks", "follow_ups"}
-    if table not in allowed_tables:
-        raise ValueError(f"Invalid table: {table}")
-    conn = get_connection()
-    conn.execute(f"UPDATE {table} SET status = ? WHERE id = ?", (status, item_id))
     conn.commit()
     # Connection is reused (singleton) — do not close
 
@@ -983,87 +1211,3 @@ def get_horizon_data(days_ahead: int = 14, owner_name: str = "Daniel") -> dict:
         "follow_ups": follow_ups,
         "tasks": tasks,
     }
-
-
-# ── Snooze ────────────────────────────────────────────────────────────────────
-
-SNOOZEABLE_TABLES = {
-    "action_items", "deadlines", "financial_items",
-    "agreements", "tasks", "follow_ups",
-}
-
-
-def _parse_snooze_until(duration: str) -> str:
-    """Parse a snooze duration like '3d', '1w', '2026-05-01' into a date string."""
-    duration = duration.strip().lower()
-    today = date.today()
-    if duration.endswith("d"):
-        days = int(duration[:-1])
-        return (today + __import__("datetime").timedelta(days=days)).isoformat()
-    if duration.endswith("w"):
-        weeks = int(duration[:-1])
-        return (today + __import__("datetime").timedelta(weeks=weeks)).isoformat()
-    # Assume it's already a YYYY-MM-DD date
-    date.fromisoformat(duration)  # validate
-    return duration
-
-
-def snooze_item(table: str, item_id: int, until: str):
-    """Snooze an item until a given date. `until` can be '3d', '1w', or 'YYYY-MM-DD'."""
-    if table not in SNOOZEABLE_TABLES:
-        raise ValueError(f"Cannot snooze table: {table}")
-    snooze_date = _parse_snooze_until(until)
-    conn = get_connection()
-    conn.execute(
-        f"UPDATE {table} SET snoozed_until = ? WHERE id = ?",
-        (snooze_date, item_id),
-    )
-    conn.commit()
-    # Connection is reused (singleton) — do not close
-    return snooze_date
-
-
-def unsnooze_item(table: str, item_id: int):
-    """Clear snooze on an item so it reappears immediately."""
-    if table not in SNOOZEABLE_TABLES:
-        raise ValueError(f"Cannot unsnooze table: {table}")
-    conn = get_connection()
-    conn.execute(f"UPDATE {table} SET snoozed_until = NULL WHERE id = ?", (item_id,))
-    conn.commit()
-    # Connection is reused (singleton) — do not close
-
-
-def get_snoozed_items() -> list[dict]:
-    """Return all currently snoozed items across all tables."""
-    conn = get_connection()
-    results = []
-    for table in sorted(SNOOZEABLE_TABLES):
-        try:
-            rows = conn.execute(
-                f"""SELECT id, '{table}' as source_table, snoozed_until,
-                           CASE
-                             WHEN snoozed_until <= date('now') THEN 'expired'
-                             ELSE 'active'
-                           END as snooze_state
-                    FROM {table}
-                    WHERE snoozed_until IS NOT NULL
-                    ORDER BY snoozed_until ASC"""
-            ).fetchall()
-            # Pull a label field for display
-            for row in rows:
-                item = dict(row)
-                # Try to get a description/title for display
-                label_row = conn.execute(
-                    f"SELECT * FROM {table} WHERE id = ?", (item["id"],)
-                ).fetchone()
-                if label_row:
-                    d = dict(label_row)
-                    item["label"] = (
-                        d.get("description") or d.get("title") or
-                        d.get("subject") or d.get("summary") or f"#{item['id']}"
-                    )
-                results.append(item)
-        except Exception:
-            pass
-    # Connection is reused (singleton) — do not close
-    return results

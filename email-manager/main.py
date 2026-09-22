@@ -9,12 +9,15 @@ Usage:
     python main.py setup          # Initialize DB, authenticate Gmail
     python main.py fetch          # Fetch new emails from Gmail
     python main.py analyze        # Analyze unprocessed emails with Claude
-    python main.py digest         # Generate and send today's briefing
+    python main.py digest         # Build and send today's bulletin board
+    python main.py digest --dry-run   # Build it to logs/last_digest.html, don't send
     python main.py run            # Fetch + analyze + digest + cleanup in one shot
-    python main.py status         # Show dashboard summary
+    python main.py status         # Show a summary of what's tracked
     python main.py schedule       # Run on recurring schedule (daemon mode)
-    python main.py mark <table> <id> <status>  # Update item status
-    python main.py dashboard      # Open web dashboard to mark items done
+
+The digest is a read-only bulletin board (Today / Next Two Weeks). There is no
+check-off: items age off by date. The old web dashboard, `mark`, and `snooze`
+commands were retired on 2026-09-16 (see _deprecated/dashboard/).
 
     # Chorus Crafters order tracking
     python main.py orders list              # Show active order pipeline
@@ -32,6 +35,7 @@ Usage:
 """
 import json
 import logging
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -61,7 +65,6 @@ from src.briefing.database import (
     get_pending_actions,
     get_sync_state,
     set_sync_state,
-    update_item_status,
     mark_email_processed,
     # order tracking
     upsert_song_order,
@@ -87,13 +90,10 @@ from src.briefing.database import (
     # labeling
     get_unlabeled_emails,
     mark_emails_labeled,
-    # horizon
+    # horizon (CLI view)
     get_horizon_data,
-    # snooze
-    snooze_item,
-    unsnooze_item,
-    get_snoozed_items,
-    SNOOZEABLE_TABLES,
+    # bulletin board (the emailed digest)
+    get_bulletin_items,
 )
 from src.client_factory import build_clients, build_calendar_clients, get_send_client
 from src.email_client import EmailClient
@@ -117,6 +117,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("email-manager")
+
+# Model defaults when config.yaml doesn't say. Sonnet 5 is the cheapest
+# current-generation model ($2 in / $10 out per M tokens as of 2026-09).
+DEFAULT_ANALYSIS_MODEL = "claude-sonnet-5"
+DEFAULT_CLEANUP_MODEL = "claude-sonnet-5"
 
 
 SMS_FORWARD_INDICATORS = [
@@ -384,11 +389,13 @@ def do_analyze(config):
     """Analyze unprocessed emails using Claude."""
     entities = load_entities(config)
     analysis_cfg = config.get("analysis", {})
-    model = analysis_cfg.get("model", "claude-opus-4-6")
+    model = analysis_cfg.get("model", DEFAULT_ANALYSIS_MODEL)
+    effort = analysis_cfg.get("effort", "low")
     batch_size = analysis_cfg.get("batch_size", 20)
 
     owner = config.get("owner", {})
-    analyzer = Analyzer(entities, model=model,
+    analyzer = Analyzer(entities, model=model, effort=effort,
+                        owner_name=owner.get("name", ""),
                         owner_profile=owner.get("profile", ""),
                         briefing_priorities=owner.get("briefing_priorities", ""))
     unprocessed = get_unprocessed_emails(limit=batch_size * 5)
@@ -448,28 +455,71 @@ def do_analyze(config):
     return total_items
 
 
-def do_digest(config, digest_type="daily", clients=None):
-    """Generate and send the digest email."""
+def do_digest(config, digest_type="daily", clients=None, dry_run=False):
+    """Build the bulletin board and email it.
+
+    With ``dry_run`` the board is written to logs/last_digest.html instead of
+    being sent (no email account is touched; Claude is still called).
+    """
     entities = load_entities(config)
     analysis_cfg = config.get("analysis", {})
-    model = analysis_cfg.get("model", "claude-opus-4-6")
-    send_to = config.get("digest", {}).get("send_to", "")
+    digest_cfg = config.get("digest", {})
+    model = analysis_cfg.get("model", DEFAULT_ANALYSIS_MODEL)
+    effort = analysis_cfg.get("effort", "low")
+    digest_effort = digest_cfg.get("effort", "medium")
+    days_ahead = int(digest_cfg.get("days_ahead", 14))
+    send_to = digest_cfg.get("send_to", "")
 
-    if not send_to:
+    if not send_to and not dry_run:
         console.print("[red]No digest.send_to configured in config.yaml[/red]")
         return
+
+    owner = config.get("owner", {})
+    owner_name = owner.get("name", "") or "Daniel"
+    first_name = owner_name.split()[0] if owner_name else "Daniel"
+    # Sent threads addressed to one of the owner's own accounts are notes to
+    # self, not replies being waited on; keep them off the board.
+    own_addresses = tuple(a.get("email", "") for a in config.get("accounts", []) if a.get("email"))
+    board_kwargs = dict(days_ahead=days_ahead, owner_name=first_name,
+                        exclude_recipients=own_addresses)
+
+    board = get_bulletin_items(**board_kwargs)
+
+    # Merge duplicate board items into one canonical entry so an obligation
+    # mentioned across several emails shows up once. Only board items are sent.
+    if config.get("features", {}).get("reconcile_duplicates", True):
+        try:
+            from src.briefing.reconcile import reconcile_duplicates
+            merged = reconcile_duplicates(model=model, effort=effort, board=board)
+            if merged:
+                console.print(f"[dim]Merged {merged} duplicate item(s) into canonical entries[/dim]")
+                board = get_bulletin_items(**board_kwargs)
+        except Exception as e:
+            log.error(f"Duplicate reconciliation failed (continuing with digest): {e}")
+
+    analyzer = Analyzer(entities, model=model, effort=effort,
+                        owner_name=first_name,
+                        owner_profile=owner.get("profile", ""),
+                        briefing_priorities=owner.get("briefing_priorities", ""))
+
+    if dry_run:
+        generator = DigestGenerator(analyzer, None, entities, send_to,
+                                    days_ahead=days_ahead, effort=digest_effort)
+        html = generator.build_html(board)
+        out = Path("logs/last_digest.html")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(generator._wrap_html(html), encoding="utf-8")
+        console.print(f"[green]Dry run: board written to {out} (not sent)[/green]")
+        return html
 
     if clients is None:
         clients = build_clients(config)
     send_client = get_send_client(config, clients)
     send_client.authenticate()
 
-    owner = config.get("owner", {})
-    analyzer = Analyzer(entities, model=model,
-                        owner_profile=owner.get("profile", ""),
-                        briefing_priorities=owner.get("briefing_priorities", ""))
-    generator = DigestGenerator(analyzer, send_client, entities, send_to)
-    html = generator.generate_and_send(digest_type)
+    generator = DigestGenerator(analyzer, send_client, entities, send_to,
+                                days_ahead=days_ahead, effort=digest_effort)
+    html = generator.generate_and_send(digest_type, board=board)
     console.print(f"[green]Digest sent to {send_to}[/green]")
     return html
 
@@ -499,9 +549,10 @@ def _build_organizer(config: dict, model_override: str | None = None) -> EmailOr
     return EmailOrganizer(
         owner_name=config["owner"]["name"],
         account_emails=cleanup_accounts,
-        model=model_override or cleanup_cfg.get("model", "claude-sonnet-4-6"),
+        model=model_override or cleanup_cfg.get("model", DEFAULT_CLEANUP_MODEL),
         batch_size=cleanup_cfg.get("batch_size", 25),
         label_cfg=label_cfg,
+        effort=cleanup_cfg.get("effort", "low"),
     )
 
 
@@ -513,6 +564,17 @@ def _print_cleanup_stats(stats: dict, dry_run: bool):
     for k, v in stats.items():
         table.add_row(k.capitalize(), str(v))
     console.print(table)
+
+
+def _is_own_briefing(email) -> bool:
+    """True for the digest the bot emails to the owner.
+
+    The digest lands in the same inbox cleanup sweeps ~20 min later, so without
+    this guard cleanup classifies and archives the briefing itself — the user
+    never sees it. Subject is set in digest.py as "Daily/Weekly Briefing — …".
+    """
+    subject = (email.get("subject") or "").strip().lower()
+    return subject.startswith("daily briefing") or subject.startswith("weekly briefing")
 
 
 def do_cleanup_inbox(config, dry_run=False, limit=100):
@@ -531,6 +593,10 @@ def do_cleanup_inbox(config, dry_run=False, limit=100):
 
     seen = cleanup_db.is_email_organized(conn, [e["id"] for e in emails])
     new_emails = [e for e in emails if e["id"] not in seen]
+    briefings = [e for e in new_emails if _is_own_briefing(e)]
+    if briefings:
+        new_emails = [e for e in new_emails if not _is_own_briefing(e)]
+        console.print(f"Leaving {len(briefings)} briefing digest email(s) untouched in the inbox.")
     if not new_emails:
         console.print("[yellow]All inbox emails already organized.[/yellow]")
         return
@@ -581,7 +647,10 @@ def setup_accounts():
         provider = getattr(client, "provider", "unknown")
         console.print(f"[{i+1}/{len(clients)}] {acct_name} ({client.account_email}) [{provider}]")
         try:
-            client.authenticate()
+            # interactive=True: if a stored token's refresh is dead, fall back to
+            # the browser flow automatically instead of requiring a manual move
+            # of the token file out of credentials/.
+            client.authenticate(interactive=True)
             console.print(f"  [green]Authorized[/green]\n")
             if provider == "gmail":
                 has_gmail = True
@@ -617,11 +686,81 @@ def analyze():
 
 @cli.command()
 @click.option("--type", "digest_type", default="daily", type=click.Choice(["daily", "weekly"]))
-def digest(digest_type):
-    """Generate and send a briefing email."""
+@click.option("--dry-run", is_flag=True, help="Write the board to logs/last_digest.html instead of emailing it")
+def digest(digest_type, dry_run):
+    """Build and send today's bulletin board."""
     config = get_config()
     init_db()
-    do_digest(config, digest_type)
+    do_digest(config, digest_type, dry_run=dry_run)
+
+
+def notify_auth_failure(config, failed, total):
+    """Alert the owner that one or more accounts need re-authorization.
+
+    Layered so a failure is never silent again, even if every account is down:
+      1. email the owner via any account that still authenticates,
+      2. write a logs/AUTH_FAILURE.txt marker,
+      3. best-effort Windows desktop toast.
+    """
+    accounts = ", ".join(email for email, _ in failed)
+    cmd = "python main.py setup-accounts"
+    summary = (
+        f"{len(failed)} of {total} email account(s) failed to authenticate and "
+        f"were skipped: {accounts}.\n\nRe-authorize by running:\n  {cmd}\n"
+    )
+    log.error(summary.replace("\n", " "))
+
+    # 1. Email alert via the first account that still works.
+    send_to = config.get("digest", {}).get("send_to", "")
+    if send_to:
+        for client in build_clients(config):
+            try:
+                client.authenticate()
+            except Exception:
+                continue
+            try:
+                client.send_email(
+                    to=send_to,
+                    subject=f"[Email Manager] {len(failed)} account(s) need re-authorization",
+                    body_html=(
+                        "<p>The daily email automation could not authenticate some accounts "
+                        "and skipped them. The digest/cleanup ran for the rest.</p>"
+                        f"<p><b>Failed:</b> {accounts}</p>"
+                        f"<p>Fix it by running <code>{cmd}</code> in the email-manager folder.</p>"
+                        "<p>(Likely cause: the Google OAuth app's 7-day token expiry — confirm "
+                        "the consent screen is published \"In production\".)</p>"
+                    ),
+                )
+                log.info(f"Auth-failure alert emailed to {send_to} via {client.account_email}")
+                break
+            except Exception as e:
+                log.error(f"Could not send alert via {client.account_email}: {e}")
+
+    # 2. Marker file.
+    try:
+        marker = Path("logs/AUTH_FAILURE.txt")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{datetime.now().isoformat()}\n\n{summary}")
+    except Exception as e:
+        log.error(f"Could not write AUTH_FAILURE marker: {e}")
+
+    # 3. Best-effort Windows toast.
+    if sys.platform == "win32":
+        try:
+            ps = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null; "
+                "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+                "[Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+                "$x=$t.GetElementsByTagName('text'); "
+                "$x.Item(0).AppendChild($t.CreateTextNode('Email Manager: re-auth needed')) | Out-Null; "
+                f"$x.Item(1).AppendChild($t.CreateTextNode('{len(failed)} account(s) failed. Run setup-accounts.')) | Out-Null; "
+                "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Email Manager').Show("
+                "[Windows.UI.Notifications.ToastNotification]::new($t))"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=15,
+                           capture_output=True)
+        except Exception as e:
+            log.error(f"Could not show desktop toast: {e}")
 
 
 @cli.command()
@@ -631,8 +770,22 @@ def run():
     init_db()
     # Build clients once and reuse across all stages (avoids 7x OAuth reads + label cache loss)
     clients = build_clients(config)
+    # Authenticate per-account in isolation: one dead token must not abort the
+    # whole pipeline. Healthy accounts still get briefed and cleaned.
+    healthy, failed = [], []
     for client in clients:
-        client.authenticate()
+        try:
+            client.authenticate()
+            healthy.append(client)
+        except Exception as e:
+            log.error(f"Auth failed for {client.account_email}: {e}")
+            failed.append((client.account_email, str(e)))
+    if failed:
+        notify_auth_failure(config, failed, total=len(clients))
+    if not healthy:
+        console.print("[red]No accounts could authenticate — aborting. Run: python main.py setup-accounts[/red]")
+        raise SystemExit(1)
+    clients = healthy
     console.print("[bold]Fetching emails from all accounts...[/bold]")
     do_fetch(config, clients=clients)
     console.print("[bold]Fetching calendar events...[/bold]")
@@ -738,36 +891,6 @@ def status():
             console.print(f"\n[bold]Cleanup Stats:[/bold] {total_organized} emails organized total")
     except Exception:
         pass
-
-
-@cli.command()
-@click.argument("table", type=click.Choice(["agreements", "deadlines", "financial_items", "action_items", "tasks", "follow_ups"]))
-@click.argument("item_id", type=int)
-@click.argument("new_status")
-def mark(table, item_id, new_status):
-    """Update an item's status (e.g., mark a deadline as 'done')."""
-    init_db()
-    update_item_status(table, item_id, new_status)
-    console.print(f"[green]Updated {table} #{item_id} -> {new_status}[/green]")
-
-
-@cli.command()
-@click.option("--port", default=5050, help="Port for the dashboard server")
-@click.option("--no-browser", is_flag=True, help="Don't auto-open the browser")
-def dashboard(port, no_browser):
-    """Launch the local web dashboard for managing pending items."""
-    init_db()
-    from src.dashboard import create_app
-    import webbrowser
-    import threading
-
-    app = create_app()
-    url = f"http://localhost:{port}"
-    if not no_browser:
-        threading.Timer(1.0, webbrowser.open, args=[url]).start()
-    console.print(f"[bold green]Dashboard running at {url}[/bold green]")
-    console.print("Press Ctrl+C to stop.")
-    app.run(host="127.0.0.1", port=port, debug=False)
 
 
 @cli.command(name="schedule")
@@ -1288,87 +1411,6 @@ def followups_scan():
     config = get_config()
     init_db()
     do_detect_follow_ups(config)
-
-
-# ── Snooze ──────────────────────────────────────────────────────────────────
-
-SNOOZE_TABLE_CHOICES = sorted(SNOOZEABLE_TABLES)
-
-
-@cli.group()
-def snooze():
-    """Snooze items so they stop appearing until a future date."""
-    pass
-
-
-@snooze.command(name="item")
-@click.argument("table", type=click.Choice(SNOOZE_TABLE_CHOICES))
-@click.argument("item_id", type=int)
-@click.argument("until")
-def snooze_cmd(table, item_id, until):
-    """Snooze an item until a date or duration.
-
-    \b
-    UNTIL can be:
-      3d          -- snooze for 3 days
-      1w          -- snooze for 1 week
-      2026-05-01  -- snooze until a specific date
-
-    \b
-    Examples:
-      snooze item action_items 5 3d
-      snooze item deadlines 2 1w
-      snooze item tasks 1 2026-04-20
-      snooze item follow_ups 3 5d
-    """
-    init_db()
-    try:
-        snooze_date = snooze_item(table, item_id, until)
-        console.print(f"[green]{table} #{item_id} snoozed until {snooze_date}[/green]")
-        console.print("[dim]It won't appear in status, horizon, or digests until then.[/dim]")
-    except ValueError as e:
-        console.print(f"[red]Invalid duration: {e}[/red]")
-        console.print("Use format: 3d, 1w, or YYYY-MM-DD")
-
-
-@snooze.command(name="wake")
-@click.argument("table", type=click.Choice(SNOOZE_TABLE_CHOICES))
-@click.argument("item_id", type=int)
-def snooze_wake(table, item_id):
-    """Wake a snoozed item immediately so it reappears."""
-    init_db()
-    unsnooze_item(table, item_id)
-    console.print(f"[green]{table} #{item_id} is now active again.[/green]")
-
-
-@snooze.command(name="list")
-def snooze_list():
-    """Show all currently snoozed items."""
-    init_db()
-    items = get_snoozed_items()
-    if not items:
-        console.print("Nothing is snoozed.")
-        return
-
-    table = Table(title="Snoozed Items")
-    table.add_column("Table")
-    table.add_column("ID", style="dim", width=4)
-    table.add_column("Item")
-    table.add_column("Snoozed Until")
-    table.add_column("State")
-
-    for item in items:
-        state = item["snooze_state"]
-        state_fmt = f"[dim]expired -- run 'wake' to restore[/dim]" if state == "expired" else "[yellow]sleeping[/yellow]"
-        table.add_row(
-            item["source_table"],
-            str(item["id"]),
-            (item.get("label") or "")[:50],
-            item["snoozed_until"],
-            state_fmt,
-        )
-    console.print(table)
-    console.print("\n[dim]Use 'snooze wake <table> <id>' to wake an item early.[/dim]")
 
 
 # ── Email Cleanup ───────────────────────────────────────────────────────────

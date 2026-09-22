@@ -15,6 +15,7 @@ from datetime import date
 from src.entities import Entity
 from src.briefing.orders import OrderExtractor
 from src.briefing import database as db
+from src.llm_usage import log_usage
 
 
 EXTRACTION_SYSTEM_PROMPT = """You are a personal assistant AI that analyzes email communications for a musician/entrepreneur who runs multiple businesses:
@@ -42,7 +43,7 @@ For financial items:
 - For credit card statements and loan statements:
   - Extract the outstanding balance as a financial item with direction "payable"
   - Use status "pending" since the balance is owed
-  - Set the counterparty to the card/lender name (e.g. "Chase Visa ending 8454", "Wells Fargo Mortgage")
+  - Set the counterparty to the card/lender name (e.g. "Visa ending 1234", "Mortgage lender")
   - Set description to include "Statement balance" or "Outstanding balance"
   - Set due_date to the payment due date from the statement
 
@@ -136,14 +137,17 @@ Only include items that are clearly present in the emails. Empty arrays are fine
 
 
 class Analyzer:
-    def __init__(self, entities: dict[str, Entity], model: str = "claude-opus-4-6",
-                 owner_profile: str = "", briefing_priorities: str = ""):
+    def __init__(self, entities: dict[str, Entity], model: str = "claude-sonnet-5",
+                 owner_profile: str = "", briefing_priorities: str = "",
+                 effort: str = "low", owner_name: str = ""):
         self.client = anthropic.Anthropic()
         self.entities = entities
         self.model = model
+        self.effort = effort
+        self.owner_name = owner_name
         self.owner_profile = owner_profile
         self.briefing_priorities = briefing_priorities
-        self._order_extractor = OrderExtractor(model=model)
+        self._order_extractor = OrderExtractor(model=model, effort=effort)
 
     def _build_entities_description(self) -> str:
         parts = []
@@ -190,9 +194,11 @@ class Analyzer:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=16000,
+            output_config={"effort": self.effort},
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        log_usage("extract", response)
 
         results = {}
         for block in response.content:
@@ -240,62 +246,70 @@ class Analyzer:
                     pass
             return {}
 
-    def generate_digest_analysis(self, digest_data: dict) -> str:
-        """Use Claude to generate a natural-language digest summary."""
-        owner_name = self.owner_profile.split("\n")[0].strip() if self.owner_profile else "the user"
+    def generate_bulletin(self, board: dict, effort: str = "medium") -> str:
+        """Write the daily bulletin board (Today / Next Two Weeks) as HTML.
 
-        # Build profile context block
+        ``board`` is the trimmed output of database.get_bulletin_items plus
+        ``today``, ``horizon_days`` and ``entities`` (see digest.py). Only what
+        is on the board is sent; the output is capped short on purpose.
+        """
+        owner = self.owner_name or "the owner"
+
         profile_block = ""
         if self.owner_profile:
-            profile_block = f"\n\nABOUT THE OWNER:\n{self.owner_profile}"
+            profile_block = f"\nAbout {owner}:\n{self.owner_profile}\n"
 
-        # Build priorities block
         priorities_block = ""
         if self.briefing_priorities:
-            priorities_block = f"\n\nBRIEFING PRIORITIES (what the owner cares about most):\n{self.briefing_priorities}"
+            priorities_block = f"\nWhat {owner} cares about most:\n{self.briefing_priorities}\n"
 
-        system_prompt = """You are a sharp, concise personal assistant writing a daily briefing email. Write in a warm but direct tone, like a trusted chief of staff.
-{profile}{priorities}
-
-Business entities:
-{entities}
-
-Format the briefing as clean HTML for email. Use headers, bullet points, and bold for emphasis. Keep it scannable.
-
-IMPORTANT: Always display times in 12-hour format with AM/PM (e.g., "2:30 PM", "9:00 AM"). Never use 24-hour / military time (e.g., "14:30", "09:00"). Convert any 24-hour times in the data to 12-hour format.
-
-Include these sections (skip any with nothing to report):
-1. <h2>Headlines</h2> — ALWAYS THE FIRST SECTION. Your editorial pick of the top 3 to 5 things the owner should know today, drawn from EVERYTHING you have (calendar, deadlines, financial items, action items, tasks, agreements, follow-up threads, and what you know about the owner's profile and priorities). NEVER more than 5 items. Each headline should be a single tight line — what it is, who it's with or about, and why it matters today specifically. Lead with the single most important thing. If there are fewer than 3 truly notable items, show fewer — do not pad. These are the cream of the crop, not a duplicate of the lists below.
-2. <h2>Urgent</h2> — anything due today or overdue, calendar events today/tomorrow, AND any action items or tasks that have been sitting unresolved for 3+ days (call these out by name with how many days they've been waiting)
-3. <h2>14-Day Horizon</h2> — THE most important detailed section. For EACH calendar event in the next 14 days, create a sub-entry. Under each event, scan through ALL pending items (action items, financial items, deadlines, follow-ups, tasks) and surface anything related to that event. Match items by: (1) same entity/business, (2) due dates falling near the event date, (3) overlapping keywords — client names, venue names, project names, honoree names. Format each event as an <h3> with date and event name, then a <ul> of related pending items. Events with nothing pending: list in a single brief line. This gives a complete "what's coming and what's still unresolved" view.
-4. <h2 style="color:#2ecc71">Financial Updates</h2> — INFORMATIONAL ONLY. This is a status section, not a call to action. Render every line in green (style="color:#2ecc71") to signal that it is an update, not a task. Combine money coming IN and money going OUT into a single list, organized by entity. Prefix incoming lines with "+ " and outgoing with "− " so direction is obvious without changing the color. Include amount and counterparty. Do NOT use words like "you owe", "must pay", "collect", "follow up on" — keep the language declarative ("$500 from Bob — Chorus Crafters song delivery", "− $200 to Wells Fargo — mortgage statement").
-5. <h2>Task List</h2> — manually-added floating tasks (not email-derived), sorted by priority and due date
-6. <h2>Action Items</h2> — email-derived action items not already surfaced in Headlines, Urgent, or Horizon. Sort by priority and age (oldest/most overdue first). Do NOT include follow-up / awaiting-reply threads here — those are intentionally not surfaced as their own section anymore.
-7. <h2>Quick Stats</h2> — emails scanned, accounts covered, items tracked
-
-Do NOT include "Active Agreements" or "Follow-ups Needed" sections. Agreements and awaiting-reply threads are inputs you can use to inform Headlines, Urgent, and the Horizon, but they no longer get their own sections.
-
-Always end with a one-sentence focus recommendation for today based on the most pressing item.""".format(
+        system_prompt = BULLETIN_SYSTEM_PROMPT.format(
+            owner=owner,
             profile=profile_block,
             priorities=priorities_block,
             entities=self._build_entities_description(),
+            horizon_days=board.get("horizon_days", 14),
         )
 
-        user_prompt = f"""Generate today's briefing from this data:
+        user_prompt = (
+            f"Today is {board.get('today')}. Board data (JSON):\n"
+            f"{json.dumps(board, separators=(',', ':'), default=str)}\n\n"
+            "Write the bulletin board HTML."
+        )
 
-{json.dumps(digest_data, indent=2, default=str)}
-
-Today is {date.today().isoformat()}. Write the full HTML email body."""
-
+        # Thinking tokens count against max_tokens on Sonnet 5. The visible
+        # board is ~1K tokens; the headroom is for the model's reasoning.
         response = self.client.messages.create(
             model=self.model,
             max_tokens=8000,
+            output_config={"effort": effort},
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        log_usage("bulletin", response)
 
-        # response.content is a list of blocks; find the text block
-        if response.content:
-            return response.content[0].text
+        for block in response.content:
+            if block.type == "text":
+                return block.text
+        return "<p>No board generated: the API returned an empty response.</p>"
 
-        return "<p>No digest generated — API returned empty response.</p>"
+
+BULLETIN_SYSTEM_PROMPT = """You write a short daily bulletin board email for {owner}. It is read-only: nothing gets checked off, so say only what matters and say it once.
+{profile}{priorities}
+Business entities (entity_key: name):
+{entities}
+
+Output clean HTML for email using only <h2>, <h3>, <ul>, <li>, and <b>. Exactly two sections, in this order.
+
+<h2>Today</h2>
+The top things to be aware of today, most important first. At most 7 bullets. Draw from: calendar events today, anything due today or overdue (say how many days overdue), high-priority items landing tomorrow, and money moving today. One line per bullet: what it is, who it is with, and the time or date. If fewer than 7 things genuinely matter today, list fewer. Never pad.
+
+<h2>Next Two Weeks</h2>
+Chronological, starting tomorrow, covering the next {horizon_days} days. One <h3> per day that has something on it, formatted like "Thu Sep 17". Under each day, bullets for calendar events (with 12-hour time), deadlines, action items, and money due that day. Skip days with nothing. Then a final <h3>No date yet</h3> with at most 6 bullets for undated items still worth knowing (recent money items, threads waiting on a reply, tasks). Omit that block if nothing is worth listing.
+
+Rules:
+- Several entries that describe the same real-world thing: write it once, as one bullet.
+- Times in 12-hour format with AM/PM. Never 24-hour time.
+- Money lines are declarative, prefixed "+ " for money coming in and "− " for money going out. Example: "+ $400 from a client, final balance on a commission". Example: "− $229 gym dues, Oct 1". No "you owe", "collect", or "pay" phrasing.
+- Do not invent or speculate. Use only the data given.
+- No intro, no summary, no stats, no advice, no closing line. Just the two sections."""

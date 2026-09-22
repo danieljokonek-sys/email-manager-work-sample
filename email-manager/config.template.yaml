@@ -23,10 +23,13 @@ owner:
 #     primary_entities: ["personal"]
 accounts: []
 
-# Digest settings
+# Digest settings. The digest is a read-only bulletin board: Today, then the
+# next two weeks. Items age off on their own; there is nothing to check off.
 digest:
   send_to: ""
   send_from_account: ""
+  days_ahead: 14        # how far the board looks forward
+  effort: "medium"      # Claude effort for writing the board (low | medium | high)
   schedule:
     daily_summary: "08:00"
     weekly_deep_dive: "monday 09:00"
@@ -69,12 +72,15 @@ sms:
   forwarding_email_subject_prefix: "Fwd: Text from"
   enabled: false
 
+# "effort" caps how much the model thinks per call (low | medium | high).
 analysis:
-  model: "claude-opus-4-6"
+  model: "claude-sonnet-5"
+  effort: "low"
   batch_size: 20
 
 cleanup:
-  model: "claude-sonnet-4-6"
+  model: "claude-sonnet-5"
+  effort: "low"
   batch_size: 25
   delay_after_digest_minutes: 20
   accounts: []

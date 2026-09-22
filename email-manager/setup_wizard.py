@@ -1406,10 +1406,10 @@ class SetupWizard(tk.Tk):
             y += ["microsoft:", f'  client_id: "{ms_id}"', '  tenant_id: "common"', ""]
 
         y += ["sms:", '  forwarding_email_subject_prefix: "Fwd: Text from"', "  enabled: false", ""]
-        y += ["analysis:", '  model: "claude-opus-4-6"', "  batch_size: 20", ""]
+        y += ["analysis:", '  model: "claude-sonnet-5"', '  effort: "low"', "  batch_size: 20", ""]
 
         cleanup_accounts = [a["email"] for a in accounts[:1]]
-        y += ["cleanup:", '  model: "claude-sonnet-4-6"', "  batch_size: 25",
+        y += ["cleanup:", '  model: "claude-sonnet-5"', '  effort: "low"', "  batch_size: 25",
               "  delay_after_digest_minutes: 20", "  accounts:"]
         for ca in cleanup_accounts:
             y.append(f'    - "{ca}"')

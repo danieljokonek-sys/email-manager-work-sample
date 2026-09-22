@@ -38,7 +38,8 @@ client.authenticate()
 organizer = EmailOrganizer(
     owner_name=config["owner"]["name"],
     account_emails=[cleanup_account],
-    model=cleanup_cfg.get("model", "claude-sonnet-4-6"),
+    model=cleanup_cfg.get("model", "claude-sonnet-5"),
+    effort=cleanup_cfg.get("effort", "low"),
     batch_size=25,
 )
 

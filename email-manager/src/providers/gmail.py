@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -41,7 +42,7 @@ class GmailProvider(EmailClient):
     def supports_calendar(self) -> bool:
         return True
 
-    def authenticate(self):
+    def authenticate(self, interactive: bool = False):
         creds = None
         token_path = Path(self.token_file)
         if token_path.exists():
@@ -50,25 +51,52 @@ class GmailProvider(EmailClient):
                 creds = None
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except RefreshError as e:
+                    # The refresh token is dead — typically Google's 7-day
+                    # expiry for OAuth apps still in "Testing" mode, or access
+                    # revoked for this account. There is no recovery without a
+                    # fresh browser consent.
+                    if not interactive:
+                        raise RefreshError(
+                            f"Gmail refresh token for {self.account_email or self.token_file} is invalid "
+                            f"({e.args[0] if e.args else e}). Re-authorize with: python main.py setup-accounts"
+                        ) from e
+                    print(f"\nRefresh failed for {self.account_email} ({e.args[0] if e.args else e}).")
+                    print("Re-authorizing in the browser...")
+                    creds = self._run_browser_flow()
             else:
-                if not Path(self.credentials_file).exists():
-                    raise FileNotFoundError(
-                        f"Missing {self.credentials_file}.\n"
-                        "Download OAuth credentials from Google Cloud Console:\n"
-                        "  APIs & Services > Credentials > Create > OAuth 2.0 Client ID > Desktop app\n"
-                        "Save the downloaded file as credentials/credentials.json"
+                # No token, or a token with no refresh capability. Only mint a
+                # new one via the browser when interactive — otherwise the
+                # scheduled run would hang waiting on a browser nobody can
+                # complete (e.g. a decommissioned account still in config).
+                if not interactive:
+                    raise RefreshError(
+                        f"Gmail account {self.account_email or self.token_file} has no usable token. "
+                        f"Re-authorize with: python main.py setup-accounts (or remove it from config.yaml)."
                     )
-                flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
-                hint = f" for {self.account_email}" if self.account_email else ""
-                print(f"\nOpening browser to authorize Gmail access{hint}...")
-                print("Sign in with the correct Google account when prompted.\n")
-                creds = flow.run_local_server(port=0, login_hint=self.account_email or None)
+                creds = self._run_browser_flow()
             token_path.parent.mkdir(parents=True, exist_ok=True)
             token_path.write_text(creds.to_json())
         self._creds = creds
         self.service = build("gmail", "v1", credentials=creds)
         return self
+
+    def _run_browser_flow(self):
+        """Open the local-server OAuth flow to mint fresh credentials."""
+        if not Path(self.credentials_file).exists():
+            raise FileNotFoundError(
+                f"Missing {self.credentials_file}.\n"
+                "Download OAuth credentials from Google Cloud Console:\n"
+                "  APIs & Services > Credentials > Create > OAuth 2.0 Client ID > Desktop app\n"
+                "Save the downloaded file as credentials/credentials.json"
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
+        hint = f" for {self.account_email}" if self.account_email else ""
+        print(f"\nOpening browser to authorize Gmail access{hint}...")
+        print("Sign in with the correct Google account when prompted.\n")
+        return flow.run_local_server(port=0, login_hint=self.account_email or None)
 
     def get_credentials(self):
         if not self._creds:

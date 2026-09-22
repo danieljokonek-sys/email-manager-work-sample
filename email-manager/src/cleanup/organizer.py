@@ -7,6 +7,8 @@ defined in the config, a minimal set of sensible defaults is used.
 import json
 import logging
 import anthropic
+
+from src.llm_usage import log_usage
 from datetime import datetime, timedelta, timezone
 from datetime import date
 
@@ -188,12 +190,13 @@ Respond with a JSON object mapping email IDs to classifications:
 
 class EmailOrganizer:
     def __init__(self, owner_name: str, account_emails: list[str],
-                 model: str = "claude-sonnet-4-6", batch_size: int = 25,
-                 label_cfg: dict | None = None):
+                 model: str = "claude-sonnet-5", batch_size: int = 25,
+                 label_cfg: dict | None = None, effort: str = "low"):
         self.client = anthropic.Anthropic()
         self.owner_name = owner_name
         self.account_emails = account_emails
         self.model = model
+        self.effort = effort
         self.batch_size = batch_size
         # If no label_cfg provided, build from defaults
         self.label_cfg = label_cfg or build_label_config({})
@@ -204,7 +207,13 @@ class EmailOrganizer:
         emails_for_prompt = [{"id": e["id"], "sender": e.get("sender", ""), "recipients": e.get("recipients", []), "subject": e.get("subject", ""), "date": e.get("date", ""), "body_snippet": e.get("body_snippet", "")[:1200], "labels": e.get("labels", [])} for e in emails]
         system_prompt = _build_classification_system_prompt(self.owner_name, self.account_emails, self.label_cfg)
         user_prompt = CLASSIFICATION_USER_PROMPT.format(categories=", ".join(self.label_cfg["all_categories"]), emails_json=json.dumps(emails_for_prompt, indent=2))
-        response = self.client.messages.create(model=self.model, max_tokens=8000, system=system_prompt, messages=[{"role": "user", "content": user_prompt}])
+        response = self.client.messages.create(
+            model=self.model, max_tokens=8000,
+            output_config={"effort": self.effort},
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        log_usage("cleanup-classify", response)
         for block in response.content:
             if block.type == "text":
                 return self._parse_json(block.text)

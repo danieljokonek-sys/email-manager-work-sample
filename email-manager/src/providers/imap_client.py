@@ -75,7 +75,7 @@ class ImapClient(EmailClient):
     def supports_calendar(self) -> bool:
         return False
 
-    def authenticate(self):
+    def authenticate(self, interactive: bool = False):
         ctx = ssl.create_default_context()
         self._imap = imaplib.IMAP4_SSL(self._imap_server, self._imap_port, ssl_context=ctx)
         self._imap.login(self.account_email, self._password)
