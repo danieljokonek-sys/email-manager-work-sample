@@ -1,0 +1,2 @@
+2026-09-22 16:15:46,360 [INFO] claude-usage: reconcile: claude-sonnet-5 in=685 out=110 cache_read=0 cache_write=1663 stop=end_turn cost=$0.0066
+2026-09-22 16:15:51,823 [INFO] claude-usage: bulletin: claude-sonnet-5 in=1595 out=689 cache_read=0 cache_write=0 stop=end_turn cost=$0.0101

@@ -1,0 +1,87 @@
+# Email Manager configuration template.
+# The setup wizard writes config.yaml from your answers; you can also copy this
+# file to config.yaml and edit it by hand. Every key has a default; see
+# src/email_manager/config.py for the full list and validation rules.
+
+owner:
+  name: ""
+  phone: ""
+  # Free text the briefing writer uses to personalise the board.
+  # Example: "I'm a freelance designer running two client businesses and managing a rental property."
+  profile: ""
+  # What matters most in your briefing.
+  # Example: "Financial obligations and deadlines are top priority. Surface anything about client invoices or upcoming events."
+  briefing_priorities: ""
+
+# Mailboxes to read. Providers: gmail, outlook, yahoo, aol, icloud, imap.
+# accounts:
+#   - name: "Personal"
+#     provider: "gmail"
+#     email: "you@gmail.com"
+#     token_file: "credentials/token_personal.json"
+#     primary_entities: ["personal"]
+accounts: []
+
+# The digest is a read-only bulletin board: Today, then the next two weeks.
+# Items age off on their own; there is nothing to check off.
+digest:
+  send_to: ""
+  send_from_account: ""
+  days_ahead: 14        # how far the board looks forward
+  effort: "medium"      # Claude effort for writing the board (low | medium | high)
+  schedule:
+    daily_summary: "08:00"
+    weekly_deep_dive: "monday 09:00"
+
+# Business entities (define your own or leave empty). Keywords give a cheap
+# first-pass match before Claude sees the email.
+entities: {}
+
+# Label categories for inbox cleanup. Each entry is a category Claude may assign.
+# protection: "vital" (never trashed by age), "standard", or "none".
+# auto_delete: true means the category is trashed (e.g. Junk).
+#
+# labels:
+#   - name: "Tax"
+#     group: "Finance"
+#     description: "Tax documents, W-2s, 1099s, CPA correspondence"
+#     protection: "vital"
+#   - name: "Junk"
+#     group: ""
+#     description: "Marketing, spam, newsletters"
+#     protection: "none"
+#     auto_delete: true
+labels: []
+
+# Google API settings (Gmail accounts only)
+google:
+  credentials_file: "credentials/credentials.json"
+  max_emails_per_fetch: 100
+  lookback_days: 90
+  calendar_days_ahead: 14
+
+# Microsoft settings (Outlook accounts only)
+# microsoft:
+#   client_id: ""
+#   tenant_id: "common"
+
+# One model for every call; effort caps how much it thinks per call
+# (low | medium | high | xhigh | max).
+analysis:
+  model: "claude-sonnet-5"
+  effort: "low"
+  batch_size: 20
+
+cleanup:
+  model: "claude-sonnet-5"
+  effort: "low"
+  batch_size: 25
+  delay_after_digest_minutes: 20
+  accounts: []          # account emails cleanup runs on
+
+features:
+  auto_label_emails: true
+  follow_up_detection: true
+  follow_up_days: 3
+  reconcile_duplicates: true
+  excluded_calendars: []   # calendar names to ignore (e.g. third-party calendars that auto-add events)

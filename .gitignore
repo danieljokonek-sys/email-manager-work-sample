@@ -38,3 +38,11 @@ Thumbs.db
 # Dry-run board output (personal content)
 **/logs/last_digest.html
 **/logs/last_success.txt
+
+# Rotated logs and coverage
+**/logs/*.log.*
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
